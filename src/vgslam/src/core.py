@@ -11,7 +11,6 @@ from graphslam.pose.se2 import PoseSE2
 from graphslam.graph import Graph
 
 from typing import Literal
-import numba
 
 
 class VGSLAM:
@@ -96,7 +95,7 @@ class VGSLAM:
             self._last_vertex_scan = scan
             self._last_subkeyframe = scan
             
-            pose_id = self._add_odom_pose(scan.pos, np.zeros(3))
+            pose_id = self._add_odom_pose(scan.pos, None)
             self._saved_scans[pose_id] = scan
         
             return None, False
@@ -225,8 +224,7 @@ class VGSLAM:
         result = small_gicp.align(
             pcd_tgt, pcd_src, tree,
             relative_pose_4x4(source.pos, target.pos) if rel_override is None else rel_override,
-            registration_type="GICP",
-            # registration_type="ICP",
+            registration_type=self._matcher_mode,
             max_correspondence_distance=self._matcher_max_corr_distance,
             verbose=self._verbose
         )
