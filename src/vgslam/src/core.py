@@ -410,7 +410,14 @@ class VGSLAM:
         occ_grid[grid == 0] = 127
         occ_grid[grid > 0] = 255
         
-        return occ_grid
+        return OccupancyGrid(
+            occ_grid,
+            -min_x, # world (0, 0) on map is located at (-min_x, -min_y)
+            -min_y,
+            width,
+            height,
+            resolution,
+        )
             
     def optimize(self):
         self._graph._vertices = list(self.vertices.values())

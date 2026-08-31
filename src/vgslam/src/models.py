@@ -3,6 +3,24 @@ import numpy as np
 import small_gicp
 # import open3d as o3d
 
+class OccupancyGrid:
+    def __init__(self, 
+        grid: np.ndarray,
+        zero_offset_x_px: int,
+        zero_offset_y_px: int,
+        width: int,
+        height: int,
+        resolution: float,
+    ) -> None:
+        self.grid = grid
+        
+        self.zero_offset_x_px = zero_offset_x_px
+        self.zero_offset_y_px = zero_offset_y_px
+
+        self.width = width
+        self.height = height
+        
+        self.resolution = resolution
 
 class PositionedCloud:
     def __init__(self, cloud: np.ndarray, pos: np.ndarray, estimated_pos: np.ndarray | None = None) -> None:
@@ -55,5 +73,3 @@ class PositionedCloud:
     def set_pose(self, transform_4x4: np.ndarray):
         self._transform_mat = transform_4x4
         self.estimated_pos = transform_4x4_to_2d_pose(transform_4x4)
-    
-    
