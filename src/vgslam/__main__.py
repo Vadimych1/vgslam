@@ -12,9 +12,7 @@ sim = _RobotSimulator(
     odom_bias_translation_walk=0.002,
     odom_bias_rotation_walk=np.deg2rad(0.05)
 )
-slam = VGSLAM(
-    verbose=False
-)
+slam = VGSLAM()
 
 scans = [
     sim.step(speed=0.2) for _ in range(700)
@@ -36,6 +34,7 @@ for scan in scans:
         poses_odometry.append(scan.odom_pos)
         poses_real.append(scan.true_pos)
 
+slam.optimize()
 poses_final = [v.pose.position for v in slam.vertices.values()]
 
 save_slam_graph(list(slam.vertices.values()), slam.edges)

@@ -1,10 +1,9 @@
 from .helpers import transform_4x4_to_2d_pose, relative_pose_4x4
 import numpy as np
 import small_gicp
-from scipy.spatial import KDTree
 # import open3d as o3d
 
-    
+
 class PositionedCloud:
     def __init__(self, cloud: np.ndarray, pos: np.ndarray, estimated_pos: np.ndarray | None = None) -> None:
         self.cloud = cloud
@@ -52,12 +51,6 @@ class PositionedCloud:
             self._kdtree = small_gicp.KdTree(self.gicp())
         
         return self._kdtree
-    
-    def scipy_kdtree(self) -> KDTree:
-        if self._sc_kdtree is None:
-            self._sc_kdtree = KDTree(self.cloud)
-            
-        return self._sc_kdtree
     
     def set_pose(self, transform_4x4: np.ndarray):
         self._transform_mat = transform_4x4

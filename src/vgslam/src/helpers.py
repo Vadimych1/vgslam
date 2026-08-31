@@ -6,19 +6,66 @@ import numpy as np
 from collections import deque
 import numba
 
+@numba.njit(cache=True)
 def world_to_grid(points: np.ndarray, min_x: float, min_y: float, resolution: float) -> np.ndarray:
-        g = np.floor((points - np.array([min_x, min_y])) / resolution)
-        return g.astype(np.int64)
+    g = np.floor((points - np.array([min_x, min_y])) / resolution)
+    return g.astype(np.int64)
+
+@numba.njit(cache=True)
+def update_scan(
+    grid,
+    perscan_points,
+    robot_positions,
+    min_x,
+    min_y,
+    resolution,
+    width,
+    height,
+    occ_dec,
+    free_inc,
+):
+    for scan_idx in range(perscan_points.shape[0]):
+        rx = robot_positions[scan_idx, 0]
+        ry = robot_positions[scan_idx, 1]
+        w_points = perscan_points[scan_idx]
+        
+        points = np.floor((w_points - np.array([min_x, min_y])) / resolution).astype(np.int64)
+        
+        for i in range(points.shape[0]):
+            px0 = points[i, 0]
+            py0 = points[i, 1]
+
+            if 0 <= px0 < width and 0 <= py0 < height:
+                grid[py0, px0] -= occ_dec
+
+            px, py = px0, py0
+            dx = abs(rx - px)
+            dy = -abs(ry - py)
+            sx = 1 if px < rx else -1
+            sy = 1 if py < ry else -1
+            err = dx + dy
+
+            while True:
+                if px == rx and py == ry:
+                    break
+                e2 = 2 * err
+                if e2 >= dy:
+                    err += dy
+                    px += sx
+                if e2 <= dx:
+                    err += dx
+                    py += sy
+                    
+                if 0 <= px < width and 0 <= py < height:
+                    grid[py, px] += free_inc
+    
+    np.clip(grid, -4, 4, out=grid)
 
 def get_topological_neighbors(
     target_id: int, 
     edges: list, 
     max_steps: int
 ) -> set[int]:
-    """
-    Returns a set of all vertex IDs within N steps (topological range) 
-    of the target_id, excluding the target_id itself.
-    """
     adj_list = {}
     for edge in edges:
         u, v = edge.vertex_ids[0], edge.vertex_ids[1]
@@ -52,47 +99,30 @@ def evaluate_registration(source, tree, transformation, max_correspondence_dista
     source_homo = np.hstack([source, np.ones((source.shape[0], 1))])
     source_transformed = (transformation @ source_homo.T).T[:, :3]
 
-    distances, _ = tree.query(source_transformed)
+    # distances, _ = tree.query(source_transformed)
+    # inlier_mask = distances < max_correspondence_distance
+    # inlier_distances = distances[inlier_mask]
 
-    inlier_mask = distances < max_correspondence_distance
-    inlier_distances = distances[inlier_mask]
+    idx, sq_distances = tree.batch_nearest_neighbor_search(
+        np.ascontiguousarray(source_transformed, dtype=np.float64)
+    )
 
-    fitness = np.sum(inlier_mask) / source.shape[0]
+    sq_distances = np.array(sq_distances)
+    idx = np.array(idx)
+
+    inlier_mask = (sq_distances < max_correspondence_distance ** 2) & (idx > -1)
+    inlier_sq_distances = sq_distances[inlier_mask]
+
+    fitness = np.sum(inlier_mask) / len(source_transformed)
     
-    if len(inlier_distances) > 0:
-        inlier_rmse = np.sqrt(np.mean(inlier_distances ** 2))
+    if len(inlier_sq_distances) > 0:
+        inlier_rmse = np.sqrt(np.mean(inlier_sq_distances))
     else:
         inlier_rmse = np.inf
 
     return fitness, inlier_rmse
 
-@numba.jit(nopython=True)
-def bresenham_update(grid, px0, py0, rx, ry, width, height, occ_dec, free_inc):
-    if 0 <= px0 < width and 0 <= py0 < height:
-        grid[py0, px0] -= occ_dec
-
-    px, py = px0, py0
-    dx = abs(rx - px)
-    dy = -abs(ry - py)
-    sx = 1 if px < rx else -1
-    sy = 1 if py < ry else -1
-    err = dx + dy
-
-    while True:
-        if px == rx and py == ry:
-            break
-        e2 = 2 * err
-        if e2 >= dy:
-            err += dy
-            px += sx
-        if e2 <= dx:
-            err += dx
-            py += sy
-        # Update the new cell (free space)
-        if 0 <= px < width and 0 <= py < height:
-            grid[py, px] += free_inc
-
-@numba.jit(nopython=True)
+@numba.njit(cache=True)
 def scan_to_cloud(ranges: np.ndarray, angles: np.ndarray, range_threshold: float = 12.0):    
     valid = (ranges > 0.1) & (ranges < range_threshold)
     ranges = ranges[valid]
@@ -104,7 +134,7 @@ def scan_to_cloud(ranges: np.ndarray, angles: np.ndarray, range_threshold: float
 
     return np.column_stack((x, y, z))
 
-@numba.jit(nopython=True)
+@numba.njit(cache=True)
 def transform_4x4_to_2d_pose(matrix):
     x = matrix[0, 3]
     y = matrix[1, 3]
@@ -113,12 +143,12 @@ def transform_4x4_to_2d_pose(matrix):
     
     return np.array([x, y, theta])
 
-@numba.jit(nopython=True)
+@numba.njit(cache=True)
 def relative_pose(a, b):
     rel_4x4 = relative_pose_4x4(a, b)
     return transform_4x4_to_2d_pose(rel_4x4)
 
-@numba.jit(nopython=True)
+@numba.njit(cache=True)
 def relative_pose_4x4(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     T_w_a = pose2d_to_transform(a)
     T_w_b = pose2d_to_transform(b)
@@ -134,7 +164,7 @@ def relative_from_vertices(a, b):
 
     return relative_pose(np.array([xa, ya, ta]), np.array([xb, yb, tb]))
 
-@numba.jit(nopython=True)
+@numba.njit(cache=True)
 def normalize_angle(a):
     while a > np.pi:
         a -= np.pi * 2
@@ -144,7 +174,7 @@ def normalize_angle(a):
         
     return a
 
-@numba.jit(nopython=True)
+@numba.njit(cache=True)
 def pose2d_to_transform(pose: np.ndarray) -> np.ndarray:
     x, y, theta = pose
     c = np.cos(theta)

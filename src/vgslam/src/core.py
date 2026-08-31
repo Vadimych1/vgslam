@@ -12,7 +12,6 @@ from graphslam.graph import Graph
 
 from typing import Literal
 
-
 class VGSLAM:
     def __init__(
         self, 
@@ -44,7 +43,7 @@ class VGSLAM:
         matcher_mode: Literal['ICP', 'GICP', 'PLANE_ICP'] = "GICP",
         
         # debugging log
-        verbose: bool = True
+        verbose: bool = False
     ) -> None:
         # graph
         self.next_vertex_id = 0
@@ -207,7 +206,14 @@ class VGSLAM:
         
         # get delta transform and apply it on the global pose
         prev_pos = self._prev_scan.pos
-        T_prev_current = relative_pose_4x4(scan.pos, prev_pos)
+        dx_rel, dy_rel, dtheta_rel = relative_pose(scan.pos, prev_pos)
+        _, _, yaw_g = -transform_4x4_to_2d_pose(self._current_global_pose)
+        
+        dx_g = np.cos(yaw_g) * dx_rel - np.sin(yaw_g) * dy_rel
+        dy_g = np.sin(yaw_g) * dx_rel + np.cos(yaw_g) * dy_rel
+        dtheta_g = dtheta_rel
+        
+        T_prev_current = pose2d_to_transform(np.array([dx_g, dy_g, dtheta_g]))
         self._current_global_pose = self._current_global_pose @ T_prev_current
 
         scan.estimated_pos = transform_4x4_to_2d_pose(self._current_global_pose)
@@ -216,7 +222,7 @@ class VGSLAM:
         return transform_4x4_to_2d_pose(self._current_global_pose), False
         
     def _process_scans(self, source: PositionedCloud, target: PositionedCloud, rel_override: np.ndarray | None = None):
-        # grab cached or newly created scan metadata
+        # grab cached or newly created scan data
         pcd_src = source.gicp()
         pcd_tgt = target.gicp()
         tree = target.kdtree()
@@ -234,7 +240,7 @@ class VGSLAM:
         # calculate transform accuracy metrics
         fitness, inlier_rmse = evaluate_registration(
             source.cloud,
-            target.scipy_kdtree(),
+            target.kdtree(),
             T_target_source,
             max_correspondence_distance=self._matcher_max_corr_distance
         )
@@ -366,7 +372,7 @@ class VGSLAM:
             
             perscan_points.append(world)
             robot_positions.append((x, y))
-        
+            
         all_points = np.vstack(perscan_points)
         
         min_x = all_points[:, 0].min()
@@ -384,19 +390,27 @@ class VGSLAM:
             dtype=np.float32,
         )
         
-        for world_pts, (rx, ry) in zip(perscan_points, robot_positions):
-            g = world_to_grid(world_pts, min_x, min_y, resolution)
-            
-            for px, py in g:
-                bresenham_update(grid, px, py, rx, ry, width, height, occ_dec=0.85, free_inc=0.4)
+        perscan_points = np.stack(perscan_points)
         
-        np.clip(grid, -4, 4, out=grid)
+        update_scan(
+            grid,
+            perscan_points,
+            robot_positions,
+            min_x,
+            min_y,
+            resolution,
+            width,
+            height,
+            0.85,
+            0.4,
+        )
         
-        occ_grid = np.zeros_like(grid, dtype=np.uint8)
+        occ_grid = np.empty_like(grid, dtype=np.uint8)
+
         occ_grid[grid < 0] = 0
         occ_grid[grid == 0] = 127
         occ_grid[grid > 0] = 255
-            
+        
         return occ_grid
             
     def optimize(self):
