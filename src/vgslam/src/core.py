@@ -11,6 +11,7 @@ from graphslam.pose.se2 import PoseSE2
 from graphslam.graph import Graph
 
 from typing import Literal
+from numba.typed.typedlist import List
 
 class VGSLAM:
     def __init__(
@@ -355,7 +356,7 @@ class VGSLAM:
         return False
     
     def create_occupancy_grid(self, resolution: float = 0.05):
-        perscan_points = []
+        perscan_points = List()
         robot_positions = []
         
         for scan in self._saved_scans.values():            
@@ -389,8 +390,6 @@ class VGSLAM:
             (height, width),
             dtype=np.float32,
         )
-        
-        perscan_points = np.stack(perscan_points)
         
         update_scan(
             grid,

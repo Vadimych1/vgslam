@@ -24,7 +24,7 @@ def update_scan(
     occ_dec,
     free_inc,
 ):
-    for scan_idx in range(perscan_points.shape[0]):
+    for scan_idx in range(len(perscan_points)):
         rx = robot_positions[scan_idx, 0]
         ry = robot_positions[scan_idx, 1]
         w_points = perscan_points[scan_idx]
