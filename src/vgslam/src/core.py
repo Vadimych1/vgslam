@@ -22,8 +22,11 @@ class VGSLAM:
         
         # loop closure
         min_chain_size: int = 5, 
-        loop_closure_max_dist: float = 0.7,
-        loop_accept_fitness: float = 0.7,
+        loop_closure_max_dist: float = 0.35,
+        loop_closure_max_ang: float = np.deg2rad(30),
+        loop_closure_min_correction: float = 0.08,
+        loop_closure_min_angle_correction: float = np.deg2rad(4),
+        loop_accept_fitness: float = 0.7,   
         coarse_search_max_candidates: int = 5,
         
         # vertex creation and sub-vertex handling
@@ -68,6 +71,9 @@ class VGSLAM:
         self._min_angle_to_subvertex = min_angle_to_subvertex
         self._min_chain_size = min_chain_size
         self._loop_closure_max_dist = loop_closure_max_dist
+        self._loop_closure_max_ang = loop_closure_max_ang
+        self._loop_closure_min_correction = loop_closure_min_correction
+        self._loop_closure_min_angle_correction = loop_closure_min_angle_correction
         self._vertex_acc_fitness = vertex_accept_fitness
         self._loop_acc_fitness = loop_accept_fitness
         self._vertex_rmse_tol = vertex_rmse_tolerance
@@ -115,8 +121,8 @@ class VGSLAM:
             # if match is bad - fallback to odometry integration
             # so no movement is lost
             if fitness <= self._vertex_acc_fitness or rmse >= self._vertex_rmse_tol:
-                scan.estimated_pos = transform_4x4_to_2d_pose(self._current_global_pose)
-                self._last_subkeyframe = scan
+                # scan.estimated_pos = transform_4x4_to_2d_pose(self._current_global_pose)
+                # self._last_subkeyframe = scan
                 return self._proc_fallback_odom(scan)
             
             # if previous sub-keyframe has no estimated position
@@ -174,8 +180,9 @@ class VGSLAM:
                     transf_2d = transform_4x4_to_2d_pose(T_prevVertex_current)
                     
                     transf_err = np.linalg.norm((transf_2d[:2] - rel_pose[:2]))
+                    transf_err_rel = transf_err / max(np.linalg.norm(rel_pose[:2]), 0.1)
                     rot_err = abs(normalize_angle(transf_2d[2] - rel_pose[2]))
-                    if transf_err < self._vert_match_dist_tol and rot_err < self._vert_match_ang_tol:
+                    if transf_err_rel < self._vert_match_dist_tol and rot_err < self._vert_match_ang_tol:
                         tr = transf_2d
 
                 # add vertex and register scan
@@ -202,25 +209,25 @@ class VGSLAM:
     def _proc_fallback_odom(self, scan: PositionedCloud):
         if self._prev_scan is None:
             return None, False
-        
-        self._scans_no_correction += 1
-        
-        # get delta transform and apply it on the global pose
-        prev_pos = self._prev_scan.pos
-        dx_rel, dy_rel, dtheta_rel = relative_pose(scan.pos, prev_pos)
-        _, _, yaw_g = -transform_4x4_to_2d_pose(self._current_global_pose)
-        
-        dx_g = np.cos(yaw_g) * dx_rel - np.sin(yaw_g) * dy_rel
-        dy_g = np.sin(yaw_g) * dx_rel + np.cos(yaw_g) * dy_rel
-        dtheta_g = dtheta_rel
-        
-        T_prev_current = pose2d_to_transform(np.array([dx_g, dy_g, dtheta_g]))
-        self._current_global_pose = self._current_global_pose @ T_prev_current
 
-        scan.estimated_pos = transform_4x4_to_2d_pose(self._current_global_pose)
+        self._scans_no_correction += 1
+
+        T_prev_current = relative_pose_4x4(
+            self._prev_scan.pos,
+            scan.pos
+        )
+
+        self._current_global_pose = (
+            self._current_global_pose @ T_prev_current
+        )
+
+        scan.estimated_pos = transform_4x4_to_2d_pose(
+            self._current_global_pose
+        )
+
         self._prev_scan = scan
-        
-        return transform_4x4_to_2d_pose(self._current_global_pose), False
+
+        return scan.estimated_pos, False
         
     def _process_scans(self, source: PositionedCloud, target: PositionedCloud, rel_override: np.ndarray | None = None):
         # grab cached or newly created scan data
@@ -230,7 +237,7 @@ class VGSLAM:
         
         result = small_gicp.align(
             pcd_tgt, pcd_src, tree,
-            relative_pose_4x4(source.pos, target.pos) if rel_override is None else rel_override,
+            relative_pose_4x4(target.pos, source.pos) if rel_override is None else rel_override,
             registration_type=self._matcher_mode,
             max_correspondence_distance=self._matcher_max_corr_distance,
             verbose=self._verbose
@@ -256,13 +263,22 @@ class VGSLAM:
     ) -> tuple[int, np.ndarray | None, tuple]:
         # iterate over scans and return the first match that has good scores
         # source array should be sorted by match probability for best results
+        best_score = -float('inf')
+        best = (-1, None, (0, 0))
+
         for i, source in enumerate(sources):
-            T_new, (fitness, inlier_rmse) = self._process_scans(source, target)
+            T_new, (fitness, rmse) = self._process_scans(source, target)
+
+            if fitness < min_confidence or rmse > rmse_max:
+                continue
             
-            if fitness > min_confidence and inlier_rmse < rmse_max:
-                return i, transform_4x4_to_2d_pose(T_new), (fitness, inlier_rmse)
+            score = fitness - 0.5 * rmse
+
+            if best is None or score > best_score:
+                best_score = score
+                best = (i, transform_4x4_to_2d_pose(T_new), (fitness, rmse))
         
-        return -1, None, (0, 0)
+        return best
     
     def _add_odom_pose(self, est_pos: np.ndarray, dpos: np.ndarray | None):
         # add a new vertex
@@ -312,19 +328,14 @@ class VGSLAM:
         
         vertices = [self.vertices[id] for id in coarse_ids if id not in blacklist]
         
-        # filter vertices by distance to current
-        cur_pose = np.array(self._prev_scan.estimated_pos[:2])
-        vertices_with_dist_sq = [(v, np.sum((np.array(v.pose.position) - cur_pose) ** 2)) for v in vertices]
-        nearest_vertices = [v for v, dist in vertices_with_dist_sq if dist <= self._loop_closure_max_dist ** 2]
-        
         # get the best match
-        scans = [self._saved_scans[v.id] for v in nearest_vertices]
+        scans = [self._saved_scans[v.id] for v in vertices]
         idx, pose, (fitness, rmse) = self._find_best_match(scans, self._prev_scan, self._loop_acc_fitness, self._vertex_rmse_tol)
         
         # if match found - calculate displacement error and 
         # close the loop if it is acceptable
         if pose is not None and idx >= 0:
-            predicted = relative_from_vertices(self.vertices[self.next_vertex_id - 1], nearest_vertices[idx])
+            predicted = relative_from_vertices(self.vertices[self.next_vertex_id - 1], vertices[idx])
             
             err = np.linalg.norm((pose - predicted)[:2])
             
@@ -335,16 +346,19 @@ class VGSLAM:
                 print("pose_err angle_err" , err, angle_err)
                 print("predicted_pose estimated_pose", predicted, pose)
             
-            if err <= 0.5 and angle_err <= np.deg2rad(30):
+            if err <= self._loop_closure_max_dist and angle_err <= self._loop_closure_max_ang and (
+                err > self._loop_closure_min_correction or
+                angle_err > self._loop_closure_min_angle_correction
+            ):
                 if self._verbose:
                     print("loop closure stats")
-                    print("pose_loop pose_prev", nearest_vertices[idx].pose.position, self.vertices[self.next_vertex_id - 1].pose.position)
+                    print("pose_loop pose_prev", vertices[idx].pose.position, self.vertices[self.next_vertex_id - 1].pose.position)
                     print("fitness:", fitness, "rmse:", rmse)
                 
-                self._add_edge(self.next_vertex_id - 1, nearest_vertices[idx].id, pose[:2], pose[2], 0.5)
+                self._add_edge(self.next_vertex_id - 1, vertices[idx].id, pose[:2], pose[2], 0.5)
                 
                 if self._verbose:
-                    print("added edge [", nearest_vertices[idx].id, self.next_vertex_id - 1, "]")
+                    print("added edge [", vertices[idx].id, self.next_vertex_id - 1, "]")
                 
                 self.optimize()
 

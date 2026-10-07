@@ -36,11 +36,9 @@ class PositionedCloud:
         
         self._descriptor: np.ndarray | None = None
         
-    def relative(self, other):
-        p1 = other.pos if other.estimated_pos is None else other.estimated_pos
-        p2 = self.pos if self.estimated_pos is None else self.estimated_pos
-
-        return relative_pose_4x4(p1, p2)
+    def relative(self, other):   # T_self_other в оценочных позах
+        assert self.estimated_pos is not None and other.estimated_pos is not None
+        return relative_pose_4x4(self.estimated_pos, other.estimated_pos)
 
     def gicp(self, voxel_downsample: bool = False, voxel_size: float = 0.05) -> small_gicp.PointCloud:
         """
@@ -59,8 +57,9 @@ class PositionedCloud:
             
         # elif self._gicp is None:
     
-        self._gicp = small_gicp.PointCloud(self.cloud)
-        small_gicp.estimate_normals_covariances(self._gicp)
+        if self._gicp is None:
+            self._gicp = small_gicp.PointCloud(self.cloud)
+            small_gicp.estimate_normals_covariances(self._gicp)
     
         return self._gicp
     

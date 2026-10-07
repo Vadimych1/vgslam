@@ -7,12 +7,20 @@ import cv2 as cv
 sim = _RobotSimulator(
     dt=0.1,
     lidar_angle_step=np.deg2rad(0.5),
-    odom_rotation_noise=np.deg2rad(0.1),
-    odom_translation_noise=0.03,
+    # odom_rotation_noise=np.deg2rad(0.1),
+    # odom_translation_noise=0.03,
     odom_bias_translation_walk=0.002,
     odom_bias_rotation_walk=np.deg2rad(0.05)
 )
-slam = VGSLAM()
+slam = VGSLAM(
+    min_chain_size=5,
+    dxy_var=0.4,
+    # matcher_max_correspondence_distance=0.4,
+    min_distance_to_vertex=0.5,
+    keyframe_match_distance_tolerance=0.2,
+    keyframe_match_angle_tolerance=np.deg2rad(7),
+    # min_distance_to_subvertex=0.1
+)
 
 scans = [
     sim.step(speed=0.2) for _ in range(700)
@@ -25,7 +33,7 @@ for scan in scans:
     pos, closed = slam.process_scan(
         PositionedCloud(
             scan_to_cloud(scan.ranges, scan.angles, 12),
-            scan.odom_pos * np.array([1, 1, -1]),
+            scan.odom_pos,
         )
     )
     
@@ -39,4 +47,5 @@ poses_final = [v.pose.position for v in slam.vertices.values()]
 
 save_slam_graph(list(slam.vertices.values()), slam.edges)
 plot_points(np.array(poses_slam), np.array(poses_real), np.array(poses_odometry), np.array(poses_final))
-cv.imwrite("map.png", slam.create_occupancy_grid())
+
+cv.imwrite("map.png", slam.create_occupancy_grid().grid)
