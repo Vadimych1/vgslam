@@ -6,61 +6,6 @@ import numpy as np
 from collections import deque
 import numba
 
-@numba.njit(cache=True)
-def world_to_grid(points: np.ndarray, min_x: float, min_y: float, resolution: float) -> np.ndarray:
-    g = np.floor((points - np.array([min_x, min_y])) / resolution)
-    return g.astype(np.int64)
-
-@numba.njit(cache=True)
-def update_scan(
-    grid,
-    perscan_points,
-    robot_positions,
-    min_x,
-    min_y,
-    resolution,
-    width,
-    height,
-    occ_dec,
-    free_inc,
-):
-    for scan_idx in range(len(perscan_points)):
-        rx = robot_positions[scan_idx, 0]
-        ry = robot_positions[scan_idx, 1]
-        w_points = perscan_points[scan_idx]
-        
-        points = np.floor((w_points - np.array([min_x, min_y])) / resolution).astype(np.int64)
-        
-        for i in range(points.shape[0]):
-            px0 = points[i, 0]
-            py0 = points[i, 1]
-
-            if 0 <= px0 < width and 0 <= py0 < height:
-                grid[py0, px0] -= occ_dec
-
-            px, py = px0, py0
-            dx = abs(rx - px)
-            dy = -abs(ry - py)
-            sx = 1 if px < rx else -1
-            sy = 1 if py < ry else -1
-            err = dx + dy
-
-            while True:
-                if px == rx and py == ry:
-                    break
-                e2 = 2 * err
-                if e2 >= dy:
-                    err += dy
-                    px += sx
-                if e2 <= dx:
-                    err += dx
-                    py += sy
-                    
-                if 0 <= px < width and 0 <= py < height:
-                    grid[py, px] += free_inc
-    
-    np.clip(grid, -4, 4, out=grid)
-
 def get_topological_neighbors(
     target_id: int, 
     edges: list, 
