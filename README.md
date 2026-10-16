@@ -8,19 +8,32 @@ Trajectories (red - real, green - noisy odometry, blue - SLAM-based trajectory, 
 
 Optimized pose graph with loop closures
 
-![slam pose graph](./demo_results/slam_graph.png)
-
+![slam pose graph](./demo_results/slam_graph.png)                
 ### Tuning
 |parameter|description|default value|
 |---------|-----------|-------------|
+|**Mapping**|
+|map_resolution: float|resolution of the map, meters per pixel|0.05|
+|map_max_cells: int|number of cells that map can use at most. increasing this value may increase RAM usage|16_000_000|
+|map_occ_dec: float|decrement of log-odds map cell value when cell is occupied|0.85|
+|map_free_inc: float|increment of log-odds map cell value when cell is free|0.4|
+|map_l_min: float|min log-odds map cell value|4.0|
+|map_l_max: float|max log-odds map cell value|4.0|
+|map_initial_size: int|initial square map side size|128|
+|map_pad_cells: int|additional number of pixels added to the map when resizing to make less array reallocations|32|
 |**Graph optimization**|
 |dxy_var: float|position variance. increase if odometry is bad|0.2| 
 |dtheta_var: float|heading variance. increase if odometry is bad|np.deg2rad(3)|
+|loop_closure_edge_uncertainty: float|how much to NOT trust the loop closure edges|0.5|
+|odometry_edge_uncertainty: float|how much to NOT trust the odometry edges|1.0|
 |**Loop closure**|
 |min_chain_size: int|minimum topological distance from last vertex for other vertex to take part in loop closuring. increasing this will make sparser loops|5| 
 |loop_closure_max_dist: float|max loop searching distance. increasing this can make more loops but they can be worse in quality. may decrease performance|0.7|
+|loop_closure_max_ang: float|max loop searching angle, same as loop_closure_max_dist|np.deg2rad(40)|
 |loop_accept_fitness: float|point cloud overlap threshold for making loop in fine search. decreasing this will make more loops with significantly lower loop quality|0.7|
 |coarse_search_max_candidates: int|increasing will search for more coarse candidates. loop closure could be better. increases compute time|5|
+|loop_closure_min_correction: float|min position correction of graph vertex to accept loop closure|0.04|
+|loop_closure_min_angle_correction: float|min rotation correction of graph vertex to accept loop closure|np.deg2rad(3)|
 |**Vertices and sub-vertex estimation**|
 |min_distance_to_vertex: float|min distance from previous vertex to create a new one|0.4|
 |min_angle_to_vertex: float|min angle delta from previous vertex to create a new one|np.deg2rad(10)|
@@ -30,10 +43,26 @@ Optimized pose graph with loop closures
 |vertex_accept_fitness: float|point cloud overlap threshold for making a new vertex. decreasing this could make more vertices with lower quality|0.6| 
 |vertex_rmse_tolerance: float|max RMSE between scans for vertex to be accepted|0.2|
 |**Keyframe matching**|
+|noise_trans_threshold: float|max between-frame odometry translation to consider movement as pure noise to prevent drift|0.005|
+|noise_rot_threshold: float|max between-frame odometry rotation to consider movement as pure noise to prevent drift|np.deg2rad(0.2)|
 |keyframe_match_distance_tolerance: float|max distance deviation between ICP-estimated and odometry-estimated transforms between two vertex keyframes|0.15|
 |keyframe_match_angle_tolerance: float|max angle difference between ICP-estimated and odometry-estimated transforms between two vertex keyframes|np.deg2rad(5)|
 |**ICP**|
 |matcher_max_correspondence_distance: float|max point correspondence distance|0.5|
 |matcher_mode: str|ICP mode, one of: 'ICP', 'GICP', 'PLANE_ICP'|"GICP"|
+|**Probabilistic Location**|
+|use_probabilistic_loc: bool|whether to use probabilistic location estimation on new session start|True|
+|loc_max_tries: int|max tries to find current position, sets position to [0, 0, 0] if expired|16|
+|loc_max_hypotheses: int|max number of location hypotheses|8|
+|loc_init_min_fitness: float|minimum fitness to consider hypothesis acceptable|0.3|
+|loc_commit_prob: float|absolute posterior for the "winner" location|0.85|
+|loc_commit_margin: float|log-odds vs. runner-up|3.0|
+|loc_min_scans: int|evidence before commit location|3|
+|loc_rmse_sigma: float|ICP likelihood parameter|0.05|
+|loc_odom_sigma: float|m, for odometry translation consistency|0.3|
+|loc_odom_ang_sigma: float|rad, for odometry angle consistency|np.deg2rad(10)|
+|loc_prune_thresh: float|prune threshold|1e-3|
+|loc_dup_dist: float|m, dedup threshold|0.5|
+|loc_dup_ang: float|rad, dedup angle threshold|np.deg2rad(30)|
 |**debugging**|
 |verbose: bool|log useful data|True|
