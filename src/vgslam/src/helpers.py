@@ -1,7 +1,3 @@
-import networkx as nx
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 from collections import deque
 import numba
@@ -44,10 +40,6 @@ def evaluate_registration(source, tree, transformation, max_correspondence_dista
     source_homo = np.hstack([source, np.ones((source.shape[0], 1))])
     source_transformed = (transformation @ source_homo.T).T[:, :3]
 
-    # distances, _ = tree.query(source_transformed)
-    # inlier_mask = distances < max_correspondence_distance
-    # inlier_distances = distances[inlier_mask]
-
     idx, sq_distances = tree.batch_nearest_neighbor_search(
         np.ascontiguousarray(source_transformed, dtype=np.float64)
     )
@@ -58,7 +50,10 @@ def evaluate_registration(source, tree, transformation, max_correspondence_dista
     inlier_mask = (sq_distances < max_correspondence_distance ** 2) & (idx > -1)
     inlier_sq_distances = sq_distances[inlier_mask]
 
-    fitness = np.sum(inlier_mask) / len(source_transformed)
+    if len(source_transformed) > 0:
+        fitness = np.sum(inlier_mask) / len(source_transformed)
+    else:
+        fitness = 0
     
     if len(inlier_sq_distances) > 0:
         inlier_rmse = np.sqrt(np.mean(inlier_sq_distances))
@@ -137,70 +132,3 @@ def pose2d_to_transform(pose: np.ndarray) -> np.ndarray:
     T[2, 3] = 0.0
     
     return T
-
-def plot_points(poses_1, poses_2, poses_3, final):
-    x1, y1 = poses_1[:, 0], poses_1[:, 1]
-    x2, y2 = poses_2[:, 0], poses_2[:, 1]
-    x3, y3 = poses_3[:, 0], poses_3[:, 1]
-    xf, yf = final[:, 0], final[:, 1]
-    
-    plt.figure(figsize=(10, 6))
-    
-    plt.plot(x1, y1, color='blue', linestyle=':', marker='o', alpha=0.3, label='Path 1 Trajectory')
-    plt.plot(x2, y2, color='red', linestyle=':', marker='s', alpha=0.3, label='Path 2 Trajectory')
-    plt.plot(x3, y3, color='green', linestyle=':', marker='D', alpha=0.3, label='Path 3 Trajectory')
-    plt.plot(xf, yf, color='yellow', linestyle='-', marker='*', alpha=0.5, label='Final Trajectory')
-
-    plt.title('Pose Graph Trajectory', fontsize=14, fontweight='bold')
-    plt.xlabel('X Position')
-    plt.ylabel('Y Position')
-    plt.grid(True, linestyle='--', alpha=0.5)
-    plt.legend()
-    plt.axis('equal')
-
-    plt.savefig('pose_graph.png', dpi=300, bbox_inches='tight')
-    plt.close()
-
-def save_slam_graph(
-    vertices: list, edges: list, filename: str = "slam_graph.png"
-):
-    G = nx.Graph()
-
-    pos = {}
-    for vertex in vertices:
-        v_id = vertex.id
-        x, y = vertex.pose.position
-        pos[v_id] = (x, y)
-        G.add_node(v_id)
-
-    for edge in edges:
-        if len(edge.vertex_ids) == 2:
-            G.add_edge(edge.vertex_ids[0], edge.vertex_ids[1])
-
-    fig, ax = plt.subplots(figsize=(10, 8))
-    ax.set_axis_on()
-    ax.tick_params(
-        left=True,
-        bottom=True,
-        labelleft=True,
-        labelbottom=True,
-    )
-
-    nx.draw_networkx_nodes(
-        G, pos, node_size=100, node_color="crimson", ax=ax
-    )
-    nx.draw_networkx_edges(
-        G, pos, width=1.5, edge_color="navy", alpha=0.7, ax=ax
-    )
-
-    label_pos = {node: (coords[0], coords[1] + 0.1) for node, coords in pos.items()}
-    nx.draw_networkx_labels(G, label_pos, font_size=8, ax=ax)
-
-    ax.set_title('Pose Graph Trajectory', fontsize=14, fontweight='bold')
-    ax.set_xlabel('X Position')
-    ax.set_ylabel('Y Position')
-    ax.grid(True, linestyle='--', alpha=0.5)
-    ax.axis('equal')
-
-    plt.savefig(filename, dpi=300, bbox_inches="tight")
-    plt.close(fig)

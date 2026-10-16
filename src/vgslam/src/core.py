@@ -1,21 +1,20 @@
 import numpy as np
-import small_gicp
 
 from .helpers import *
 from .models import *
 from .scandb import ScanDB
 from .map_builder import MapBuilder
-
-from graphslam.vertex import Vertex
-from graphslam.edge.edge_odometry import EdgeOdometry
-from graphslam.pose.se2 import PoseSE2
-from graphslam.graph import Graph
-
-from typing import Literal
+from .graph import PoseGraph
+from .icp_matcher import ICPMatcher, ICP_MATCHER_MODE
+from .hypotetical_localization import LocalizationHypothesisSelection, LocalizationHypothesis
 
 # save&read
 import pickle
 import json, struct
+
+from graphslam.vertex import Vertex
+from graphslam.edge.edge_odometry import EdgeOdometry
+from graphslam.pose.se2 import PoseSE2
 
 class VGSLAM:
     def __init__(
@@ -32,7 +31,9 @@ class VGSLAM:
         
         # graph optimization
         dxy_var: float = 0.2, 
-        dtheta_var: float = np.deg2rad(3), 
+        dtheta_var: float = np.deg2rad(3),
+        loop_closure_edge_uncertainty: float = 0.5,
+        odometry_edge_uncertainty: float = 1.0,
         
         # loop closure
         min_chain_size: int = 5, 
@@ -60,11 +61,26 @@ class VGSLAM:
         
         # icp
         matcher_max_correspondence_distance: float = 0.5,
-        matcher_mode: Literal['ICP', 'GICP', 'PLANE_ICP'] = "GICP",
+        matcher_mode: ICP_MATCHER_MODE = "GICP",
+        
+        # probabilistic location
+        use_probabilistic_loc: bool = True,
+        loc_max_tries: int = 16,
+        loc_max_hypotheses: int = 8,
+        loc_init_min_fitness: float = 0.3,
+        loc_commit_prob: float = 0.85,          # absolute posterior for the winner
+        loc_commit_margin: float = 3.0,         # log-odds vs. runner-up
+        loc_min_scans: int = 3,                 # evidence before we commit
+        loc_rmse_sigma: float = 0.05,           # for ICP likelihood
+        loc_odom_sigma: float = 0.3,            # m, for odometry consistency
+        loc_odom_ang_sigma: float = float(np.deg2rad(10)),
+        loc_prune_thresh: float = 1e-3,
+        loc_dup_dist: float = 0.5,              # m, dedup threshold
+        loc_dup_ang: float = float(np.deg2rad(30)),
         
         # debugging log
         verbose: bool = False
-    ) -> None:
+    ):
         # mapping
         self.map_builder = MapBuilder(
             map_resolution,
@@ -79,10 +95,14 @@ class VGSLAM:
         self._pending_scans: list[PositionedCloud] = []
         
         # graph
-        self.next_vertex_id = 0
-        self.vertices: dict[int, Vertex] = {}
-        self.edges: list[EdgeOdometry] = []
-        self._graph = Graph([], [])
+        self._loop_closure_edge_uncertainty = loop_closure_edge_uncertainty
+        self._odometry_edge_uncertainty = odometry_edge_uncertainty
+        self._graph = PoseGraph(
+            dxy_var,
+            dtheta_var,
+            loop_closure_edge_uncertainty,
+            odometry_edge_uncertainty,
+        )
 
         # scan
         self._current_global_pose = np.eye(4)
@@ -92,8 +112,12 @@ class VGSLAM:
         self._last_subkeyframe = None
         self._scans_no_correction = 0
         self._scandb = ScanDB()
+        self._matcher = ICPMatcher(
+            matcher_max_correspondence_distance,
+            matcher_mode,
+        )
         
-        # variables
+        # variables        
         self._min_distance_to_vertex = min_distance_to_vertex
         self._min_angle_to_vertex = min_angle_to_vertex
         self._min_distance_to_subvertex = min_distance_to_subvertex
@@ -108,8 +132,6 @@ class VGSLAM:
         self._vertex_rmse_tol = vertex_rmse_tolerance
         self._vert_match_dist_tol = keyframe_match_distance_tolerance
         self._vert_match_ang_tol = keyframe_match_angle_tolerance
-        self._dxy_var = dxy_var
-        self._dtheta_var = dtheta_var
         self._matcher_max_corr_distance = matcher_max_correspondence_distance
         self._max_scans_no_correction = max_scans_no_subvertex
         self._coarse_search_max_candidates = coarse_search_max_candidates
@@ -117,21 +139,75 @@ class VGSLAM:
         self._noise_rot_threshold = noise_rot_threshold
         self._matcher_mode = matcher_mode
         
+        # localization hypothesis
+        self._prob_loc_done = not use_probabilistic_loc
+        self._use_prob_loc = use_probabilistic_loc
+        self._loc_tries = 0
+        self._loc_max_tries = loc_max_tries
+        if use_probabilistic_loc:
+            self._hypothesis_localizer = LocalizationHypothesisSelection(
+                self._saved_scans,
+                self._matcher,
+                self._graph,
+                self._scandb,
+                loc_max_hypotheses,
+                loc_init_min_fitness,
+                loc_commit_prob,          # absolute posterior for the winner
+                loc_commit_margin,        # log-odds vs. runner-up
+                loc_min_scans,            # evidence before we commit
+                loc_rmse_sigma,           # for ICP likelihood
+                loc_odom_sigma,           # m, for odometry consistency
+                loc_odom_ang_sigma,
+                loc_prune_thresh,
+                loc_dup_dist,             # m, dedup threshold
+                loc_dup_ang,
+            )
+        
         # debug
         self._verbose = verbose
     
     def process_scan(self, scan: PositionedCloud) -> tuple[np.ndarray | None, bool]:
-        """
-        Process new lidar scan with odometry
-        """
+        if self._use_prob_loc and not self._prob_loc_done:
+            if len(self._saved_scans) > 0:
+                res = self._hypothesis_localizer.find_on_map(scan)
+                if res is not None:
+                    if self._verbose:
+                        print("prob_loc commit")
+                        
+                    self._commit_localization(*res)
+                    self._hypothesis_localizer.reset()
+                    self._prob_loc_done = True
+                
+                    return transform_4x4_to_2d_pose(self._current_global_pose), False
+                
+                elif self._loc_tries > self._loc_max_tries:
+                    if self._verbose:
+                        print("prob_loc timeout")
+                        
+                    self._prob_loc_done = True
+                
+                else:
+                    if self._verbose:
+                        print("prob_loc tried")
+                        
+                    self._loc_tries += 1
+                    return transform_4x4_to_2d_pose(self._current_global_pose), False
+
+            else:
+                if self._verbose:
+                    print("prob_loc empty hypothesis")
+                    
+                self._prob_loc_done = True
         
+        # process scan        
         pos, closed = self._process_scan(scan)
         
+        # redraw map from keyframes only if loop closed
         if closed:
             self._pending_scans.clear()
             self.map_builder.rebuild(self._saved_scans.values())
-            
-            print("clear and rebuild")
+
+        # add a scan to drawing list
         else:
             if scan.estimated_pos is not None:
                 self._pending_scans.append(scan)
@@ -147,50 +223,57 @@ class VGSLAM:
         if self._prev_scan is None or self._last_vertex_scan is None or self._last_subkeyframe is None:
             scan.estimated_pos = scan.pos
             
+            self._current_global_pose = pose2d_to_transform(scan.estimated_pos)
+
             self._prev_scan = scan
             self._last_vertex_scan = scan
             self._last_subkeyframe = scan
-            
-            pose_id = self._add_odom_pose(scan.pos, None)
+
+            pose_id = self._graph.create_vertex(scan.pos, None)
             self._saved_scans[pose_id] = scan
-        
+            
+            self._scandb.add_vertex_scan(
+                pose_id,
+                scan,
+            )
+
             return None, False
-        
+
         # correct using ICP if moved too much from last sub-keyframe or scans correction expired
         from_skf = np.linalg.norm(relative_pose(self._last_subkeyframe.pos, scan.pos)[:2])
         if from_skf > self._min_distance_to_subvertex or self._scans_no_correction >= self._max_scans_no_correction:
             self._scans_no_correction = 0
-            
+
             # estimate transform from previous sub-keyframe to current
-            T_sub_current, (fitness, rmse) = self._process_scans(
+            T_sub_current, (fitness, rmse) = self._matcher.match(
                 scan,
                 self._last_subkeyframe, 
                 relative_pose_4x4(self._last_subkeyframe.pos, scan.pos)
             )
-            
+
             # if match is bad - fallback to odometry integration
             # so no movement is lost
             if fitness <= self._vertex_acc_fitness or rmse >= self._vertex_rmse_tol:
                 # scan.estimated_pos = transform_4x4_to_2d_pose(self._current_global_pose)
                 # self._last_subkeyframe = scan
                 return self._proc_fallback_odom(scan)
-            
+
             # if previous sub-keyframe has no estimated position
             # fallback to odometry (should never happen)
             if self._last_subkeyframe.estimated_pos is None:
                 return self._proc_fallback_odom(scan)
-            
+
             # update global position using new transform            
             self._current_global_pose = pose2d_to_transform(self._last_subkeyframe.estimated_pos) @ T_sub_current
-            
+
             # update positions and cached scans
             pose_2d = transform_4x4_to_2d_pose(self._current_global_pose)
             scan.estimated_pos = pose_2d
             self._last_subkeyframe = scan
             self._prev_scan = scan
-            
+
             closed = False
-            
+
             # should never happen
             if self._last_vertex_scan.estimated_pos is None:
                 return pose_2d, False
@@ -199,12 +282,12 @@ class VGSLAM:
             distance = np.linalg.norm((pose_2d - self._last_vertex_scan.estimated_pos)[:2])
             dtheta = pose_2d[2] - self._last_vertex_scan.estimated_pos[2]
             dtheta = abs(normalize_angle(dtheta))
-            
+
             # add vertex only if distance or angle change is bigger than threshold 
             if distance >= self._min_distance_to_vertex or dtheta >= self._min_angle_to_vertex:
                 # get relative from accurate previously estimated poses
                 rel_over = relative_pose_4x4(self._last_vertex_scan.estimated_pos, scan.estimated_pos)
-                T_prevVertex_current, (fitness, rmse) = self._process_scans(
+                T_prevVertex_current, (fitness, rmse) = self._matcher.match(
                     scan, 
                     self._last_vertex_scan, 
                     rel_override=rel_over
@@ -225,7 +308,7 @@ class VGSLAM:
                 # by default we use transform between estimated poses
                 tr = rel_pose = relative_pose(self._last_vertex_scan.estimated_pos, scan.estimated_pos)
                 
-                # ...but if match is really good - we can use estimated delta to be more accurate
+                # ...but if match is really good - we can use estimated ICP pose delta to be more accurate
                 if fitness >= self._vertex_acc_fitness and rmse < self._vertex_rmse_tol:
                     transf_2d = transform_4x4_to_2d_pose(T_prevVertex_current)
                     
@@ -236,7 +319,8 @@ class VGSLAM:
                         tr = transf_2d
 
                 # add vertex and register scan
-                pose_id = self._add_odom_pose(
+                # pose_id = self._add_odom_pose(
+                pose_id = self._graph.create_vertex(
                     pose_2d,
                     tr
                 )
@@ -248,22 +332,24 @@ class VGSLAM:
                 self._saved_scans[pose_id] = scan
                 self._last_vertex_scan = scan
 
+                # ...and try to close loop
                 closed = self.try_to_close_loop()
             
             return pose_2d, closed
         
         else:
-            # just increment position by odometry
+            # just integrate position by odometry
             return self._proc_fallback_odom(scan)
             
     def _proc_fallback_odom(self, scan: PositionedCloud):
+        # if there is no previous scan - nothing to calculate
         if self._prev_scan is None:
             return None, False
 
+        # used to prevent odometry drift when staying still
         d = relative_pose(self._prev_scan.pos, scan.pos)
         trans = np.linalg.norm(d[:2])
         rot = abs(d[2])
-        
         if trans < self._noise_trans_threshold and rot < self._noise_rot_threshold:
             scan.estimated_pos = self._prev_scan.estimated_pos
             self._prev_scan = scan
@@ -271,111 +357,16 @@ class VGSLAM:
 
         self._scans_no_correction += 1
 
+        # update global pose using estimated delta
         T_prev_current = relative_pose_4x4(
             self._prev_scan.pos,
             scan.pos
         )
-
-        self._current_global_pose = (
-            self._current_global_pose @ T_prev_current
-        )
-
-        scan.estimated_pos = transform_4x4_to_2d_pose(
-            self._current_global_pose
-        )
-
+        self._current_global_pose = self._current_global_pose @ T_prev_current
+        scan.estimated_pos = transform_4x4_to_2d_pose(self._current_global_pose)
         self._prev_scan = scan
 
         return scan.estimated_pos, False
-        
-    def _process_scans(self, source: PositionedCloud, target: PositionedCloud, rel_override: np.ndarray | None = None):
-        # grab cached or newly created scan data
-        pcd_src = source.gicp()
-        pcd_tgt = target.gicp()
-        tree = target.kdtree()
-        
-        result = small_gicp.align(
-            pcd_tgt, pcd_src, tree,
-            relative_pose_4x4(target.pos, source.pos) if rel_override is None else rel_override,
-            registration_type=self._matcher_mode,
-            max_correspondence_distance=self._matcher_max_corr_distance,
-            verbose=self._verbose
-        )
-        
-        T_target_source = result.T_target_source
-
-        # calculate transform accuracy metrics
-        fitness, inlier_rmse = evaluate_registration(
-            source.cloud,
-            target.kdtree(),
-            T_target_source,
-            max_correspondence_distance=self._matcher_max_corr_distance
-        )
-        
-        return T_target_source, (fitness, inlier_rmse)
-    
-    def _find_best_match(self, 
-        sources: list[PositionedCloud], 
-        target: PositionedCloud, 
-        min_confidence = 0.9, 
-        rmse_max = 0.1
-    ) -> tuple[int, np.ndarray | None, tuple]:
-        best_score = -float('inf')
-        best = (-1, None, (0, 0))
-
-        for i, source in enumerate(sources):
-            T_new, (fitness, rmse) = self._process_scans(source, target)
-
-            if fitness < min_confidence or rmse > rmse_max:
-                continue
-            
-            score = fitness - 0.5 * rmse
-
-            if best is None or score > best_score:
-                best_score = score
-                best = (i, T_new, (fitness, rmse))
-        
-        i, T, stats = best
-        if i > -1:
-            return (i, transform_4x4_to_2d_pose(T), stats)
-    
-        else:
-            return best
-    
-    def _add_odom_pose(self, est_pos: np.ndarray, dpos: np.ndarray | None):
-        # add a new vertex
-        self.vertices[self.next_vertex_id] = Vertex(
-            vertex_id=self.next_vertex_id,
-            pose=PoseSE2(
-                position=est_pos[:2],
-                orientation=est_pos[2]
-            ),
-            fixed=self.next_vertex_id == 0
-        )
-        
-        # and join it if dpos is provided
-        if self.next_vertex_id > 0 and dpos is not None:
-            self._add_edge(
-                self.next_vertex_id - 1,
-                self.next_vertex_id,
-                dpos[:2],
-                dpos[2],
-                1.0
-            )
-        
-        self.next_vertex_id += 1
-        return self.next_vertex_id - 1
-    
-    def _add_edge(self, id_a: int, id_b: int, odom_dpos: np.ndarray, odom_dtheta: float, var_mul: float):
-        # add an edge with variances
-        self.edges.append(EdgeOdometry(vertex_ids=[id_a, id_b], information=np.array([
-            [1 / (self._dxy_var * var_mul), 0, 0],
-            [0, 1 / (self._dxy_var * var_mul), 0],
-            [0, 0, 1 / (self._dtheta_var * var_mul)],
-        ]), estimate=PoseSE2(
-            position=odom_dpos,
-            orientation=odom_dtheta
-        )))
 
     def try_to_close_loop(self) -> bool:
         if self._prev_scan is None or self._prev_scan.estimated_pos is None:
@@ -386,18 +377,27 @@ class VGSLAM:
 
         # ids are always in distance-ascending order
         coarse_ids, _ = self._scandb.search_candidates(self._prev_scan, self._coarse_search_max_candidates, self._min_chain_size)
-        blacklist = get_topological_neighbors(self.next_vertex_id - 1, self.edges, self._min_chain_size)
+        blacklist = get_topological_neighbors(
+            self._graph.last_vertex_id, 
+            self._graph.edges, 
+            self._min_chain_size
+        )
 
-        vertices = [self.vertices[id] for id in coarse_ids if id not in blacklist]
+        vertices = [self._graph.vertices[id] for id in coarse_ids if id not in blacklist]
 
         # get the best match
         scans = [self._saved_scans[v.id] for v in vertices]
-        idx, pose, (fitness, rmse) = self._find_best_match(scans, self._prev_scan, self._loop_acc_fitness, self._vertex_rmse_tol)
+        idx, pose, (fitness, rmse) = self._matcher.find_best_match(
+            scans, 
+            self._prev_scan, 
+            self._loop_acc_fitness, 
+            self._vertex_rmse_tol
+        )
 
         # if match found - calculate displacement error and 
         # close the loop if it is acceptable
         if pose is not None and idx >= 0:
-            predicted = relative_from_vertices(self.vertices[self.next_vertex_id - 1], vertices[idx])
+            predicted = relative_from_vertices(self._graph.vertices[self._graph.last_vertex_id], vertices[idx])
 
             err = np.linalg.norm((pose - predicted)[:2])
 
@@ -412,17 +412,33 @@ class VGSLAM:
                 err > self._loop_closure_min_correction or
                 angle_err > self._loop_closure_min_angle_correction
             ):
+                weight = fitness * np.exp(-rmse / 0.05)
+
                 if self._verbose:
                     print("loop closure stats")
-                    print("pose_loop pose_prev", vertices[idx].pose.position, self.vertices[self.next_vertex_id - 1].pose.position)
+                    print("pose_loop pose_prev", vertices[idx].pose.position, self._graph.vertices[self._graph.last_vertex_id].pose.position)
                     print("fitness:", fitness, "rmse:", rmse)
+                    print("weight:", weight)
 
-                self._add_edge(self.next_vertex_id - 1, vertices[idx].id, pose[:2], pose[2], 0.5)
+                self._graph.create_edge(
+                    self._graph.last_vertex_id,
+                    vertices[idx].id, 
+                    pose[:2], 
+                    pose[2], 
+                    self._loop_closure_edge_uncertainty / np.clip(weight, 0.1, 2.0)
+                )
 
                 if self._verbose:
-                    print("added edge [", vertices[idx].id, self.next_vertex_id - 1, "]")
+                    print("added edge [", vertices[idx].id, self._graph.last_vertex_id, "]")
 
-                self.optimize()
+                self._graph.optimize()
+                
+                # update vertex values
+                for vertex in self._graph.vertices.values():
+                    self._saved_scans[vertex.id].estimated_pos = vertex.pose
+                
+                # update current global pos
+                self._current_global_pose = pose2d_to_transform(self._graph.get_pose())
 
                 return True
 
@@ -438,44 +454,90 @@ class VGSLAM:
 
         return self.map_builder.to_occupancy_grid(occupied_thresh)
 
-    def optimize(self):
-        self._graph._vertices = list(self.vertices.values())
-        self._graph._edges = self.edges
-        self._graph._initialize()
+    def new_session(self, initial_position: np.ndarray | None):
+        """
+        start a new SLAM localization session
+        resets all session-bound variables, including position
+        
+        starts probabilistic pose search if the *initial_position* is None 
+        
+        @param initial_position: x, y, theta
+        """
+        
+        self._last_vertex_scan = None
+        self._prev_scan = None
+        self._last_subkeyframe = None
+        self._scans_no_correction = 0
+        
+        if initial_position is None:
+            self._prob_loc_done = False
+        
+        else:
+            self._current_global_pose = pose2d_to_transform(initial_position)
 
-        res = self._graph.optimize(verbose=self._verbose)
+    def _commit_localization(
+        self, h: LocalizationHypothesis, scan: PositionedCloud
+    ) -> None:
+        """Lock the winning hypothesis in and reseed the SLAM state from it."""
+        scan.estimated_pos = h.pose
+        self._current_global_pose = pose2d_to_transform(h.pose)
 
-        for vertex in self.vertices.values():
-            self._saved_scans[vertex.id].estimated_pos = vertex.pose
+        self._prev_scan             = scan
+        self._last_vertex_scan      = scan
+        self._last_subkeyframe      = scan
+        self._scans_no_correction   = 0
 
-        last_vertex = self.vertices[self.next_vertex_id - 1]
-        self._current_global_pose = pose2d_to_transform(
-            last_vertex.pose
-        )
+        # Anchor the graph at the localized pose and register the scan.
+        pose_id = self._graph.create_vertex(h.pose, None)
+        self._saved_scans[pose_id] = scan
+        self._scandb.add_vertex_scan(pose_id, scan)
 
-        if self._verbose:
-            print("optimized graph in", res.duration_s)
+        # Optional: connect it to the reference vertex with a strong prior so
+        # the graph is not disconnected.  Direction: from new -> ref.
+        if h.vertex_id != pose_id:
+            ref_pose = self._graph.vertices[h.vertex_id].pose
+            rel = relative_pose(h.pose, ref_pose)   # T_new_ref in 2D
+            self._graph.create_edge(
+                pose_id,
+                h.vertex_id,
+                rel[:2],
+                rel[2],
+                self._loop_closure_edge_uncertainty / 2.0,
+            )
+            
+            self._graph.optimize()
+            for vertex in self._graph.vertices.values():
+                self._saved_scans[vertex.id].estimated_pos = vertex.pose
 
-    def save_to_file(self, fp: str):
+        # Rebuild the map from keyframes now that the pose is trustworthy.
+        self.map_builder.rebuild(self._saved_scans.values())
+
+    def save_to_file(self, fp: str) -> None:
+        # сбрасываем pending в карту, иначе потеряем последние ~8 сканов
         if self._pending_scans:
             self.map_builder.add_scans(self._pending_scans)
             self._pending_scans.clear()
-        
-        vertices = self.vertices
-        edges = self.edges
+
+        # PoseSE2 не всегда итерируется — достаём явно
+        def pose_to_list(p) -> list[float]:
+            return [float(p.position[0]), float(p.position[1]), float(p.orientation)]
+
+        graph = self._graph
+
         vertices = [
-            [int(k), *map(float, v.pose)] 
-            for k, v in vertices.items()
+            [int(vid), *pose_to_list(v.pose)]
+            for vid, v in graph.vertices.items()
         ]
+
         edges = [
             [
-                list(map(int, v.vertex_ids)),
-                [*map(float, v.estimate)],
-                v.information.flatten().astype(float).tolist(),
+                list(map(int, e.vertex_ids)),
+                pose_to_list(e.estimate),
+                np.asarray(e.information, dtype=np.float64).flatten().tolist(),
             ]
-            for v in edges
+            for e in graph.edges
         ]
-        
+
         parameters = {
             # --- mapping ---
             "map_resolution": self.map_builder.resolution,
@@ -488,8 +550,10 @@ class VGSLAM:
             "map_pad_cells": self.map_builder._pad_cells,
 
             # --- graph optimization ---
-            "dxy_var": self._dxy_var,
-            "dtheta_var": self._dtheta_var,
+            "dxy_var": graph._dxy_var,
+            "dtheta_var": graph._dtheta_var,
+            "odometry_edge_uncertainty": self._odometry_edge_uncertainty,
+            "loop_closure_edge_uncertainty": self._loop_closure_edge_uncertainty,
 
             # --- loop closure ---
             "min_chain_size": self._min_chain_size,
@@ -520,20 +584,21 @@ class VGSLAM:
             "matcher_mode": self._matcher_mode,
 
             # --- runtime state ---
-            "next_vertex_id": int(self.next_vertex_id),
+            "next_vertex_id": int(graph.next_vertex_id),
+            "scans_no_correction": int(self._scans_no_correction),
 
-            # --- graph ---
+            # --- graph data ---
             "graph_vertices": vertices,
             "graph_edges": edges,
         }
-        
-        params_encoded = json.dumps(parameters, separators=(',', ':')).encode("utf-8")
-        
-        scandb_encoded = self._scandb.to_bytes()
-        
-        scans = {int(k): v.to_bytes() for k, v in self._saved_scans.items()}
-        scans_encoded = pickle.dumps(scans)
-        
+
+        params_encoded  = json.dumps(parameters, separators=(',', ':')).encode("utf-8")
+        scandb_encoded  = self._scandb.to_bytes()
+        scans_encoded   = pickle.dumps(
+            {int(k): v.to_bytes() for k, v in self._saved_scans.items()},
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
         with open(fp, "wb") as f:
             for blob in (params_encoded, scandb_encoded, scans_encoded):
                 f.write(struct.pack(">I", len(blob)))
@@ -542,17 +607,18 @@ class VGSLAM:
     @staticmethod
     def load_from_file(fp: str) -> "VGSLAM":
         with open(fp, "rb") as f:
-            def read_blob():
+            def read_blob() -> bytes:
                 n = struct.unpack(">I", f.read(4))[0]
                 return f.read(n)
 
-            params_encoded = read_blob()
-            scandb_encoded = read_blob()
-            scans_encoded = read_blob()
+            params_encoded  = read_blob()
+            scandb_encoded  = read_blob()
+            scans_encoded   = read_blob()
 
         parameters = json.loads(params_encoded.decode("utf-8"))
-        scans_raw = pickle.loads(scans_encoded)
-        
+        scans_raw  = pickle.loads(scans_encoded)      # dict[int, bytes]
+
+        # 1. создаём SLAM с сохранёнными параметрами
         slam = VGSLAM(
             map_resolution=parameters["map_resolution"],
             map_max_cells=parameters["map_max_cells"],
@@ -565,6 +631,8 @@ class VGSLAM:
 
             dxy_var=parameters["dxy_var"],
             dtheta_var=parameters["dtheta_var"],
+            odometry_edge_uncertainty=parameters["odometry_edge_uncertainty"],
+            loop_closure_edge_uncertainty=parameters["loop_closure_edge_uncertainty"],
 
             min_chain_size=parameters["min_chain_size"],
             loop_closure_max_dist=parameters["loop_closure_max_dist"],
@@ -590,46 +658,74 @@ class VGSLAM:
             matcher_max_correspondence_distance=parameters["matcher_max_correspondence_distance"],
             matcher_mode=parameters["matcher_mode"],
         )
-        
+
+        # 2. восстанавливаем вершины напрямую в _graph._vertices
         for v_data in parameters["graph_vertices"]:
-            vid = int(v_data[0])
+            vid    = int(v_data[0])
             x, y, theta = float(v_data[1]), float(v_data[2]), float(v_data[3])
-            slam.vertices[vid] = Vertex(
+            slam._graph._vertices[vid] = Vertex(
                 vertex_id=vid,
-                pose=PoseSE2(position=np.array([x, y]), orientation=theta),
+                pose=PoseSE2(position=np.array([x, y], dtype=np.float64),
+                            orientation=theta),
                 fixed=(vid == 0),
             )
-        
-        for e_data in parameters["graph_edges"]:
-            ids = list(map(int, e_data[0]))
-            x, y, theta = float(e_data[1][0]), float(e_data[1][1]), float(e_data[1][2])
-            info = np.asarray(e_data[2], dtype=np.float64).reshape(3, 3)
 
-            slam.edges.append(EdgeOdometry(
+        # 3. восстанавливаем рёбра (с information-матрицей)
+        for e_data in parameters["graph_edges"]:
+            ids        = list(map(int, e_data[0]))
+            x, y, theta = float(e_data[1][0]), float(e_data[1][1]), float(e_data[1][2])
+            info       = np.asarray(e_data[2], dtype=np.float64).reshape(3, 3)
+
+            slam._graph._edges.append(EdgeOdometry(
                 vertex_ids=ids,
                 information=info,
-                estimate=PoseSE2(position=np.array([x, y]), orientation=theta),
+                estimate=PoseSE2(position=np.array([x, y], dtype=np.float64),
+                                orientation=theta),
             ))
-        
-        slam.next_vertex_id = int(parameters["next_vertex_id"])
-        
+
+        # 4. счётчики
+        slam._graph.next_vertex_id = int(parameters["next_vertex_id"])
+        slam._scans_no_correction  = int(parameters["scans_no_correction"])
+
+        # 5. ScanDB + сохранённые сканы
         slam._scandb = ScanDB.from_bytes(scandb_encoded)
         slam._saved_scans = {
             int(k): PositionedCloud.from_bytes(v)
             for k, v in scans_raw.items()
         }
-        
-        if slam.next_vertex_id > 0:
-            last_id = slam.next_vertex_id - 1
+
+        # 6. нормализуем estimated_pos — после сохранения мог остаться PoseSE2
+        for scan in slam._saved_scans.values():
+            ep = scan.estimated_pos
+            if ep is not None and not isinstance(ep, np.ndarray):
+                scan.estimated_pos = np.array(
+                    [ep.position[0], ep.position[1], ep.orientation],
+                    dtype=np.float64,
+                )
+
+        # 7. восстанавливаем «текущие» указатели из последнего keyframe'а
+        if slam._graph.next_vertex_id > 0:
+            last_id   = slam._graph.next_vertex_id - 1
             last_scan = slam._saved_scans[last_id]
 
             slam._last_vertex_scan = last_scan
-            slam._prev_scan = last_scan
+            slam._prev_scan        = last_scan
             slam._last_subkeyframe = last_scan
 
-            p = last_scan.estimated_pos
-            slam._current_global_pose = pose2d_to_transform(p)
+            slam._current_global_pose = pose2d_to_transform(last_scan.estimated_pos) # type: ignore
 
+        # 8. пересобираем карту по keyframe'ам — грид детерминирован
         slam.map_builder.rebuild(slam._saved_scans.values())
         
+        # 9
+        if slam._use_prob_loc:
+            slam._hypothesis_localizer = LocalizationHypothesisSelection(
+                slam._saved_scans,
+                slam._matcher,
+                slam._graph,
+                slam._scandb,
+            )
+            slam._prob_loc_done = False
+            slam._loc_tries = 0
+
         return slam
